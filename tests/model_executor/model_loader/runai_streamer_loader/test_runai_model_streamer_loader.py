@@ -6,11 +6,14 @@ import types
 from unittest.mock import patch
 
 import pytest
+import torch
 
+from tests.utils import create_new_process_for_each_test
 from vllm import SamplingParams
 from vllm.config.load import LoadConfig
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader import runai_streamer_loader as rsl
+from vllm.utils.mem_constants import GiB_bytes
 
 load_format = "runai_streamer"
 test_model = "openai-community/gpt2"
@@ -155,20 +158,50 @@ def test_runai_get_all_weights_matches_load_weights_source():
         ),
     ],
 )
-def test_runai_reload_weights(base_model, mul_model, add_model, vllm_runner):
+@pytest.mark.parametrize("deep_sleep", [False, True], ids=["plain", "deep_sleep"])
+@create_new_process_for_each_test()
+def test_runai_reload_weights(
+    base_model, mul_model, add_model, deep_sleep, vllm_runner
+):
+    free, total = torch.accelerator.get_memory_info()
+    used_bytes_baseline = total - free
+
+    def reload(llm, path):
+        if deep_sleep:
+            # Level 2 discards the parameter memory, so after wake_up the weights
+            # can only come from the reload: a tensor the streamer fails to
+            # deliver changes the output instead of keeping a stale valid value.
+            llm.get_llm().sleep(level=2)
+            free, total = torch.accelerator.get_memory_info()
+            assert total - free - used_bytes_baseline < 3 * GiB_bytes
+            llm.get_llm().wake_up(tags=["weights"])
+        llm.collective_rpc("reload_weights", kwargs={"weights_path": path})
+        if deep_sleep:
+            free, total = torch.accelerator.get_memory_info()
+            assert total - free - used_bytes_baseline < 4 * GiB_bytes
+            llm.get_llm().wake_up(tags=["kv_cache"])
+
     with vllm_runner(
         model_name=base_model,
         load_format=load_format,
+        enable_sleep_mode=deep_sleep,
         enable_prefix_caching=False,
         max_model_len=16,
         max_num_seqs=1,
     ) as llm:
-        llm.collective_rpc("reload_weights", kwargs={"weights_path": mul_model})
+        base_output = llm.generate_greedy(["3 4 ="], max_tokens=4)
+
+        reload(llm, mul_model)
         mul_perp = llm.generate_prompt_perplexity(["3 4 = 12"], mask=["3 4 ="])[0]
         add_perp = llm.generate_prompt_perplexity(["3 4 = 7"], mask=["3 4 ="])[0]
         assert mul_perp < add_perp
 
-        llm.collective_rpc("reload_weights", kwargs={"weights_path": add_model})
+        reload(llm, add_model)
         mul_perp = llm.generate_prompt_perplexity(["3 4 = 12"], mask=["3 4 ="])[0]
         add_perp = llm.generate_prompt_perplexity(["3 4 = 7"], mask=["3 4 ="])[0]
         assert add_perp < mul_perp
+
+        # Round trip back to the original weights over the reloaded ones (and,
+        # with deep_sleep, over discarded memory) must reproduce the output.
+        reload(llm, base_model)
+        assert llm.generate_greedy(["3 4 ="], max_tokens=4) == base_output
