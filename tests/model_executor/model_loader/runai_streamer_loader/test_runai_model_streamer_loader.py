@@ -124,25 +124,51 @@ def test_runai_invalid_extra_config_leaves_environ_untouched():
         assert "RUNAI_STREAMER_CONCURRENCY" not in os.environ
 
 
-def test_runai_get_all_weights_matches_load_weights_source():
-    # model_weights (e.g. an s3:// URI) takes precedence over model, and
-    # revision is passed through.
-    fake_self = types.SimpleNamespace(
-        _get_weights_iterator=lambda path, revision: iter(
-            [(f"{path}@{revision}", None)]
-        )
-    )
-    model_config = types.SimpleNamespace(
-        model="org/model", model_weights="s3://bucket/weights", revision="myrev"
-    )
+@pytest.mark.parametrize(
+    "model_config,expected_source",
+    [
+        # Object storage: ModelConfig keeps the URI in model_weights and points
+        # model at the pulled config directory, so model_weights must win.
+        (
+            types.SimpleNamespace(
+                model="/tmp/pulled-config-files",
+                model_weights="s3://bucket/weights",
+                revision="myrev",
+            ),
+            "s3://bucket/weights",
+        ),
+        # HF repo or local path: model_weights is empty, model is the source.
+        (
+            types.SimpleNamespace(
+                model="org/model", model_weights="", revision="myrev"
+            ),
+            "org/model",
+        ),
+    ],
+    ids=["object_storage", "hf_repo"],
+)
+def test_runai_get_all_weights_matches_load_weights_source(
+    model_config, expected_source
+):
+    loader = get_runai_model_loader()
+    calls: list[tuple[str, str | None]] = []
 
-    weights = list(
-        rsl.RunaiModelStreamerLoader.get_all_weights(
-            fake_self, model_config, model=None
-        )
-    )
+    def fake_iterator(path, revision):
+        calls.append((path, revision))
+        return iter([(f"{path}@{revision}", None)])
 
-    assert weights == [("s3://bucket/weights@myrev", None)]
+    loader._get_weights_iterator = fake_iterator
+
+    weights = list(loader.get_all_weights(model_config, model=None))
+    assert weights == [(f"{expected_source}@myrev", None)]
+
+    # load_weights hands the same generator to model.load_weights, so the
+    # initial load and a reload can never resolve different sources.
+    received: list[tuple[str, object]] = []
+    model = types.SimpleNamespace(load_weights=lambda ws: received.extend(ws))
+    loader.load_weights(model, model_config)
+    assert received == weights
+    assert calls == [(expected_source, "myrev")] * 2
 
 
 @pytest.mark.parametrize(
