@@ -1247,6 +1247,163 @@ def multi_thread_safetensors_weights_iterator(
                 yield key, state_dict.pop(key)
 
 
+def _runai_read_ranges(
+    streamer: Any, paths: list[str], ranges: list[list[tuple[int, int, int]]]
+) -> None:
+    """Read the (offset, size, destination address) ranges of each file, and wait.
+
+    Calls the streamer's C API directly, so no collective runs: the single Engram
+    reader calls this while its peers wait in a broadcast."""
+    from runai_model_streamer.libstreamer.libstreamer import (
+        runai_request,
+        runai_response,
+        runai_response_str,
+    )
+
+    if not any(ranges):
+        return
+    runai_request(
+        streamer,
+        paths,
+        [len(file_ranges) for file_ranges in ranges],
+        [offset for file_ranges in ranges for offset, _, _ in file_ranges],
+        [size for file_ranges in ranges for _, size, _ in file_ranges],
+        [dst for file_ranges in ranges for _, _, dst in file_ranges],
+    )
+    while True:
+        response = runai_response(streamer)
+        if response is None:
+            raise RuntimeError("RunAI streamer ended before the read completed")
+        code, _, file_index, _, done = response
+        if code != 0:
+            raise RuntimeError(
+                f"RunAI read of {paths[file_index]} failed: {runai_response_str(code)}"
+            )
+        if done:
+            return
+
+
+def _runai_direct_cpu_weights_iterator(
+    hf_weights_files: list[str],
+    shared_destination: Callable[[str], tuple[torch.Tensor, int] | None],
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Read CPU weight files without the streamer's ring of buffers.
+
+    A tensor with a shared destination, a DP-shared Engram table given as
+    (table, first checkpoint row), is read straight into that table and yielded
+    as a meta tensor, which tells its weight loader that the data is in place.
+    The other tensors are read into one buffer and yielded from it.
+
+    The ring holds whole tensors, so a table that fills its memory limit leaves
+    one buffer: the ring then reads a table while its consumer waits, and the
+    consumer copies it while the ring waits."""
+    from runai_model_streamer.file_streamer import FileStreamer
+    from runai_model_streamer.safetensors_streamer.safetensors_pytorch import (
+        get_safetensors_dtype_map,
+    )
+
+    dtypes = get_safetensors_dtype_map()
+    with FileStreamer() as fs:
+        for path in hf_weights_files:
+            fs.handle_object_store(path, fs.streamer)
+
+        # the safetensors header: its 8 byte length, then the JSON
+        lengths = [np.empty(8, dtype=np.uint8) for _ in hf_weights_files]
+        _runai_read_ranges(
+            fs.streamer,
+            hf_weights_files,
+            [[(0, 8, length.ctypes.data)] for length in lengths],
+        )
+        header_sizes = [int(length.view(np.uint64)[0]) for length in lengths]
+        headers = [np.empty(size, dtype=np.uint8) for size in header_sizes]
+        _runai_read_ranges(
+            fs.streamer,
+            hf_weights_files,
+            [[(8, header.nbytes, header.ctypes.data)] for header in headers],
+        )
+
+        # (name, shape, dtype, file offset, size, table or buffer offset), by file
+        plan: list[list[tuple[str, list[int], torch.dtype, int, int, Any]]] = []
+        buffer_bytes = 0
+        for header_size, header in zip(header_sizes, headers):
+            entries = json.loads(header.tobytes())
+            entries.pop("__metadata__", None)
+            file_plan = []
+            for name, entry in sorted(
+                entries.items(), key=lambda item: item[1]["data_offsets"][0]
+            ):
+                begin, end = entry["data_offsets"]
+                offset = 8 + header_size + begin
+                shape, dtype = entry["shape"], dtypes[entry["dtype"]]
+                destination = shared_destination(name)
+                if destination is None:
+                    # aligned for any dtype
+                    buffer_bytes = -(-buffer_bytes // 64) * 64
+                    file_plan.append(
+                        (name, shape, dtype, offset, end - begin, buffer_bytes)
+                    )
+                    buffer_bytes += end - begin
+                    continue
+                table, first_row = destination
+                row_bytes = (end - begin) // max(shape[0], 1)
+                if (
+                    not table.is_contiguous()
+                    or table.nbytes != table.shape[0] * row_bytes
+                    or first_row + table.shape[0] > shape[0]
+                ):
+                    raise RuntimeError(
+                        f"{name} {shape} does not fit its table "
+                        f"{tuple(table.shape)} from row {first_row}"
+                    )
+                file_plan.append(
+                    (name, shape, dtype, offset + first_row * row_bytes,
+                     table.nbytes, table)
+                )
+            plan.append(file_plan)
+
+        buffer = torch.empty(buffer_bytes, dtype=torch.uint8)
+        start = time.perf_counter()
+        _runai_read_ranges(
+            fs.streamer,
+            hf_weights_files,
+            [
+                [
+                    (
+                        offset,
+                        size,
+                        place.data_ptr()
+                        if isinstance(place, torch.Tensor)
+                        else buffer.data_ptr() + place,
+                    )
+                    for _, _, _, offset, size, place in file_plan
+                ]
+                for file_plan in plan
+            ],
+        )
+        elapsed = time.perf_counter() - start
+        sizes = [
+            (size, isinstance(place, torch.Tensor))
+            for file_plan in plan
+            for _, _, _, _, size, place in file_plan
+        ]
+        total = sum(size for size, _ in sizes)
+        logger.info(
+            "RunAI direct CPU read: %.1f GiB (%.1f GiB into shared tables) in "
+            "%.2fs, %.1f GiB/s",
+            total / 2**30,
+            sum(size for size, shared in sizes if shared) / 2**30,
+            elapsed,
+            total / 2**30 / max(elapsed, 1e-9),
+        )
+
+    for file_plan in plan:
+        for name, shape, dtype, _, size, place in file_plan:
+            if isinstance(place, torch.Tensor):
+                yield name, torch.empty(shape, dtype=dtype, device="meta")
+            else:
+                yield name, buffer[place : place + size].view(dtype).view(shape)
+
+
 def runai_safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
@@ -1254,6 +1411,9 @@ def runai_safetensors_weights_iterator(
     cpu_weights_group: Any = None,
     is_shared_cpu_weight: Callable[[str], bool] | None = None,
     process_group: Any = ...,
+    shared_cpu_weight_destination: (
+        Callable[[str], tuple[torch.Tensor, int] | None] | None
+    ) = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     cpu_filenames = set(
@@ -1290,18 +1450,25 @@ def runai_safetensors_weights_iterator(
                     )
                 else:
                     group = cpu_weights_group
-                    weights = (
-                        iter(
-                            runai_safetensors_weights_iterator(
+                    direct = (
+                        shared_cpu_weight_destination is not None
+                        and os.environ.get("VLLM_RUNAI_ENGRAM_DIRECT_READ", "1")
+                        == "1"
+                    )
+                    weights = None
+                    if group.rank_in_group == 0:
+                        weights = iter(
+                            _runai_direct_cpu_weights_iterator(
+                                cpu_files, shared_cpu_weight_destination
+                            )
+                            if direct
+                            else runai_safetensors_weights_iterator(
                                 cpu_files,
                                 use_tqdm_on_load,
                                 is_distributed=False,
                                 process_group=None,
                             )
                         )
-                        if group.rank_in_group == 0
-                        else None
-                    )
                     logger.info(
                         "Shared Engram loading with one reader for %d ranks",
                         group.world_size,

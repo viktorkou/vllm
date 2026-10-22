@@ -159,6 +159,7 @@ class RunaiModelStreamerLoader(BaseModelLoader):
         metadata_dir: str | None = None,
         cpu_weights_group=None,
         is_shared_cpu_weight=None,
+        shared_cpu_weight_destination=None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         hf_weights_files = self._prepare_weights(model_or_path, revision)
@@ -172,6 +173,7 @@ class RunaiModelStreamerLoader(BaseModelLoader):
             self._is_distributed,
             cpu_weights_group=cpu_weights_group,
             is_shared_cpu_weight=is_shared_cpu_weight,
+            shared_cpu_weight_destination=shared_cpu_weight_destination,
         )
 
     def download_model(self, model_config: ModelConfig) -> None:
@@ -219,11 +221,21 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                 mapped = model.hf_to_vllm_mapper.apply_list([name])
                 return len(mapped) == 1 and mapped[0] in owners
 
+            def shared_destination(name):
+                # the table this checkpoint tensor fills, and the checkpoint row
+                # the table starts at (its weight loader copies the same rows)
+                mapped = model.hf_to_vllm_mapper.apply_list([name])
+                if len(mapped) != 1 or mapped[0] not in owners:
+                    return None
+                param = params[mapped[0]]
+                return param.data, param.engram_vocab_start
+
             yield from self._get_weights_iterator(
                 model_weights,
                 model_config.revision,
                 cpu_weights_group=group,
                 is_shared_cpu_weight=is_shared,
+                shared_cpu_weight_destination=shared_destination,
             )
             return
         is_unused_weight = getattr(model, "is_unused_checkpoint_weight", None)
