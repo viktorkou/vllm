@@ -851,7 +851,9 @@ class DPSharedEngramStorage:
     def load_weight(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor
     ) -> None:
-        if self.group.rank_in_group == 0:
+        # A meta tensor on the leader means its loader read the rows into this
+        # storage already.
+        if self.group.rank_in_group == 0 and not loaded_weight.is_meta:
             _engram_head_shard_weight_loader(param, loaded_weight)
         # Read order may differ across ranks. Equal load counts ensure all shared
         # weights are ready after the last weight-loader call returns.
