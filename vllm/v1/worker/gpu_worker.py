@@ -212,15 +212,8 @@ class AsyncIntermediateTensors(IntermediateTensors):
         return object.__getattribute__(self, name)
 
 
-# Split limit for the caching allocator while loading and profiling. One MiB
-# ABOVE PyTorch's kLargeBuffer (20 MiB) rather than equal to it: a 1-10 MiB
-# request gets a 20 MiB segment, and once its tensor is freed the segment
-# coalesces into a single 20 MiB block. At max_split_size_mb:20 that block is
-# oversize and is never handed to a request below the limit again, so each
-# such allocation strands 20 MiB until the device is full and every allocation
-# has to flush the cache and retry. A loader that yields many 1-10 MiB device
-# tensors (e.g. the RunAI streamer in distributed mode on a large MoE) loaded
-# ~7x slower. Blocks of 21 MiB and up are still never split.
+# Above PyTorch's 20 MiB segment for 1-10 MiB requests: at 20 a freed segment
+# is oversize, is never reused, and fills the device.
 _MAX_SPLIT_SIZE_MB = 21
 
 
