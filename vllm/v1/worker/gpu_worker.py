@@ -212,6 +212,18 @@ class AsyncIntermediateTensors(IntermediateTensors):
         return object.__getattribute__(self, name)
 
 
+# Split limit for the caching allocator while loading and profiling. One MiB
+# ABOVE PyTorch's kLargeBuffer (20 MiB) rather than equal to it: a 1-10 MiB
+# request gets a 20 MiB segment, and once its tensor is freed the segment
+# coalesces into a single 20 MiB block. At max_split_size_mb:20 that block is
+# oversize and is never handed to a request below the limit again, so each
+# such allocation strands 20 MiB until the device is full and every allocation
+# has to flush the cache and retry. A loader that yields many 1-10 MiB device
+# tensors (e.g. the RunAI streamer in distributed mode on a large MoE) loaded
+# ~7x slower. Blocks of 21 MiB and up are still never split.
+_MAX_SPLIT_SIZE_MB = 21
+
+
 class Worker(WorkerBase):
     def __init__(
         self,
@@ -598,8 +610,7 @@ class Worker(WorkerBase):
         with (
             self._maybe_get_memory_pool_context(tag="weights"),
             set_current_vllm_config(self.vllm_config),
-            # 20 MiB is the minimum PyTorch allows for max_split_size_mb.
-            self._scoped_allocator_max_split(max_split_size_mb=20),
+            self._scoped_allocator_max_split(max_split_size_mb=_MAX_SPLIT_SIZE_MB),
             self._external_weight_charges.track(),
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
@@ -728,7 +739,7 @@ class Worker(WorkerBase):
             # counted as consumed and taken from the KV cache. Blocks above the
             # limit are never split, so they stay releasable. Exits before
             # memory_profiling measures, restoring the original limit.
-            self._scoped_allocator_max_split(max_split_size_mb=20),
+            self._scoped_allocator_max_split(max_split_size_mb=_MAX_SPLIT_SIZE_MB),
             set_current_vllm_config(self.vllm_config),
         ):
             self.model_runner.profile_run(randomize_inputs=self.randomize_dummy_inputs)
