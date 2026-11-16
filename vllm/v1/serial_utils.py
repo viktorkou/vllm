@@ -494,6 +494,11 @@ def run_method(
     cloudpickle.
     If the method is a callable, it will be called directly.
     """
+    if not isinstance(method, str):
+        # An arbitrary callable may write the model's weights.
+        from vllm.device_allocator import mark_weights_modified
+
+        mark_weights_modified()
     if isinstance(method, bytes):
         func = partial(cloudpickle.loads(method), obj)
     elif isinstance(method, str):
