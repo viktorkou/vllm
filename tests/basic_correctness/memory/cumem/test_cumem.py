@@ -8,7 +8,7 @@ import torch
 
 import vllm.device_allocator.cumem as cumem
 from vllm import LLM, SamplingParams
-from vllm.device_allocator import get_mem_allocator_instance
+from vllm.device_allocator import get_mem_allocator_instance, mark_weights_modified
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import PIN_MEMORY
 
@@ -718,3 +718,172 @@ def test_cudagraph_pool_sleep(level):
     weight.fill_(2.0)  # Level 2 discards weights; emulate the reload.
     held[0].replay()
     assert torch.equal(held[1], torch.full_like(x, 5.0))
+
+
+REWRITING_WORKER_METHODS = {
+    "add_lora",
+    "apply_model",
+    "checkpoint_restore",
+    "elastic_ep_execute",
+    "finish_weight_update",
+    "load_model",
+    "reload_weights",
+    "remove_lora",
+    "reset_weights",
+    "start_draft_weight_update",
+    "start_weight_update",
+    "update_weights",
+}
+
+
+class NoopWorkerExtension:
+    """A worker extension that only exists to turn backup reuse off."""
+
+    def noop(self) -> None:
+        pass
+
+
+def test_weight_writing_worker_methods_mark_backups_stale():
+    """Every Worker method that can write weights is decorated, and no other is."""
+    from vllm.v1.worker.gpu_worker import Worker
+
+    marked = {
+        name
+        for name in dir(Worker)
+        if getattr(getattr(Worker, name), "_rewrites_weights", False)
+    }
+    assert marked == REWRITING_WORKER_METHODS
+
+
+@create_new_process_for_each_test("fork" if current_platform.is_cuda() else "spawn")
+def test_weights_backup_reuse_skips_only_unchanged_weights(monkeypatch):
+    """A sleep copies weights to the host only when they may have changed."""
+    allocator = get_mem_allocator_instance()
+    allocator.reuse_weights_backup = True
+    with allocator.use_memory_pool("weights"):
+        weights = torch.full((1 << 20,), 3, dtype=torch.uint8, device=DEVICE_TYPE)
+    with allocator.use_memory_pool("runtime"):
+        runtime = torch.full((1 << 20,), 7, dtype=torch.uint8, device=DEVICE_TYPE)
+
+    tags_copied_to_host: list[str] = []
+    original_memcpy = cumem.libcudart.cudaMemcpy
+
+    def record_memcpy(dst, src, size):
+        if src in allocator.pointer_to_data:  # device -> host
+            tags_copied_to_host.append(allocator.pointer_to_data[src].tag)
+        return original_memcpy(dst, src, size)
+
+    monkeypatch.setattr(cumem.libcudart, "cudaMemcpy", record_memcpy)
+
+    def cycle() -> list[str]:
+        tags_copied_to_host.clear()
+        allocator.sleep(offload_tags=("weights", "runtime"))
+        copied = sorted(tags_copied_to_host)
+        allocator.wake_up()
+        return copied
+
+    assert cycle() == ["runtime", "weights"]  # no backup yet
+    assert cycle() == ["runtime"]  # the weights backup is current
+    assert torch.equal(weights, torch.full_like(weights, 3))
+    assert torch.equal(runtime, torch.full_like(runtime, 7))
+
+    mark_weights_modified()
+    weights.fill_(5)
+    assert cycle() == ["runtime", "weights"]
+    assert torch.equal(weights, torch.full_like(weights, 5))
+    assert cycle() == ["runtime"]
+
+
+@pytest.mark.parametrize("backend", ["uni", "mp"])
+@create_new_process_for_each_test("fork" if current_platform.is_cuda() else "spawn")
+def test_callable_rpc_makes_the_weights_backup_stale(backend, monkeypatch):
+    """A callable run on the worker may write weights: the next sleep must save them."""
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    monkeypatch.setenv("VLLM_SLEEP_REUSE_WEIGHTS_BACKUP", "1")
+    llm = LLM(
+        "Qwen/Qwen3-0.6B",
+        enable_sleep_mode=True,
+        enforce_eager=True,
+        kv_cache_memory_bytes=256 * 1024 * 1024,
+        max_model_len=1024,
+        max_num_seqs=4,
+        gpu_memory_utilization=0.05,
+        distributed_executor_backend=backend,
+    )
+
+    def zero_first_parameter(worker) -> None:
+        next(worker.model_runner.get_model().parameters()).data.zero_()
+
+    llm.sleep(level=1)
+    llm.wake_up()  # the next sleep may skip the weights copy
+    llm.collective_rpc(zero_first_parameter)
+    changed = llm.collective_rpc("compute_weight_checksums")
+    llm.sleep(level=1)
+    llm.wake_up()
+    assert llm.collective_rpc("compute_weight_checksums") == changed
+
+
+@pytest.mark.parametrize(
+    "env, sleep_mode, lora, extension, expected",
+    [
+        ("0", True, False, False, False),
+        ("1", True, False, False, True),
+        ("1", True, True, False, False),
+        ("1", True, False, True, False),
+        ("1", False, False, False, None),
+    ],
+    ids=["env-off", "reuse", "lora", "worker-extension", "sleep-mode-off"],
+)
+@create_new_process_for_each_test("fork" if current_platform.is_cuda() else "spawn")
+def test_weights_backup_reuse_is_enabled_only_when_safe(
+    env, sleep_mode, lora, extension, expected, monkeypatch
+):
+    """`expected` is the allocator's flag; None means no allocator was created."""
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    monkeypatch.setenv("VLLM_SLEEP_REUSE_WEIGHTS_BACKUP", env)
+    llm = LLM(
+        "Qwen/Qwen3-0.6B",
+        enable_sleep_mode=sleep_mode,
+        enforce_eager=True,
+        enable_lora=lora,
+        worker_extension_cls=f"{__name__}.NoopWorkerExtension" if extension else "",
+        kv_cache_memory_bytes=256 * 1024 * 1024,
+        max_model_len=1024,
+        max_num_seqs=4,
+        gpu_memory_utilization=0.05,
+    )
+
+    def reuse_enabled(worker) -> bool | None:
+        # Not get_mem_allocator_instance(): that would create the singleton.
+        allocator = cumem.CuMemAllocator.instance
+        return None if allocator is None else allocator.reuse_weights_backup
+
+    assert llm.collective_rpc(reuse_enabled) == [expected]
+
+
+@create_new_process_for_each_test("fork" if current_platform.is_cuda() else "spawn")
+def test_weights_backup_reuse_preserves_generation_across_sleep_levels(monkeypatch):
+    """Level-1 sleeps reuse the backup; a level-2 cycle reloads weights and drops it."""
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    monkeypatch.setenv("VLLM_SLEEP_REUSE_WEIGHTS_BACKUP", "1")
+    llm = LLM(
+        "Qwen/Qwen3-0.6B",
+        enable_sleep_mode=True,
+        enforce_eager=True,
+        kv_cache_memory_bytes=256 * 1024 * 1024,
+        max_model_len=1024,
+        max_num_seqs=4,
+        gpu_memory_utilization=0.05,
+    )
+    sampling_params = SamplingParams(temperature=0, max_tokens=10)
+    expected = llm.generate("How are you?", sampling_params)[0].outputs[0].token_ids
+    checksums = llm.collective_rpc("compute_weight_checksums")
+
+    for level in (1, 1, 2, 1, 1):
+        llm.sleep(level=level)
+        llm.wake_up()
+        if level == 2:
+            llm.collective_rpc("reload_weights")
+        tokens = llm.generate("How are you?", sampling_params)[0].outputs[0].token_ids
+        assert tokens == expected
+        assert llm.collective_rpc("compute_weight_checksums") == checksums

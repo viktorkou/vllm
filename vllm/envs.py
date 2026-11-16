@@ -129,6 +129,7 @@ if TYPE_CHECKING:
     VLLM_TRITON_FORCE_FIRST_CONFIG: bool = False
     VLLM_TRITON_JIT_WARMUP_NUM_THREADS: int = 4
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
+    VLLM_SLEEP_REUSE_WEIGHTS_BACKUP: bool = False
     VLLM_SKIP_P2P_CHECK: bool = True
     VLLM_PP_TRANSPORT: Literal["auto", "nccl", "copy_engine"] = "auto"
     VLLM_DISABLED_KERNELS: list[str] = []
@@ -1276,6 +1277,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, allow loading or unloading lora adapters in runtime,
     "VLLM_ALLOW_RUNTIME_LORA_UPDATING": lambda: (
         os.environ.get("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "0").strip().lower()
+        in ("1", "true")
+    ),
+    # If set, level-1 sleep skips the device-to-host copy of weights whose host
+    # backup is known to still match the device (see CuMemAllocator).
+    "VLLM_SLEEP_REUSE_WEIGHTS_BACKUP": lambda: (
+        os.environ.get("VLLM_SLEEP_REUSE_WEIGHTS_BACKUP", "0").strip().lower()
         in ("1", "true")
     ),
     # We assume drivers can report p2p status correctly.

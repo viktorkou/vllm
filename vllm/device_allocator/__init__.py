@@ -24,6 +24,10 @@ class AllocationData:
     tag: str
     cpu_backup_tensor: torch.Tensor | None = None
     is_asleep: bool = False
+    # True while `cpu_backup_tensor` holds exactly the device contents: set
+    # when they were copied in either direction, cleared when the allocation
+    # may have been written (`mark_weights_modified`) or the backup released.
+    backup_in_sync: bool = False
 
 
 def discardable_allocations(
@@ -58,6 +62,17 @@ class MemAllocator(Protocol):
     def wake_up(self, tags: list[str] | None = None) -> None: ...
 
     def get_current_usage(self) -> int: ...
+
+
+def mark_weights_modified() -> None:
+    """Record that weights may have been written, so any host backup of them
+    is out of date. A no-op when the CUDA sleep allocator was never created."""
+    if not current_platform.is_cuda_alike():
+        return
+    from vllm.device_allocator.cumem import CuMemAllocator
+
+    if CuMemAllocator.instance is not None:
+        CuMemAllocator.instance.mark_weights_modified()
 
 
 def get_mem_allocator_instance() -> MemAllocator:

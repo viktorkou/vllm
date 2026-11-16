@@ -126,6 +126,9 @@ class CuMemAllocator:
         # See discussions in https://github.com/vllm-project/vllm/pull/22724
         self.python_malloc_callback = self._python_malloc_callback
         self.python_free_callback = self._python_free_callback
+        # Set by the worker once it knows nothing rewrites weights while
+        # serving (no LoRA, no expert rebalancing).
+        self.reuse_weights_backup: bool = False
 
     @staticmethod
     def _create_and_map(allocation_handle: HandleType) -> None:
@@ -317,15 +320,31 @@ class CuMemAllocator:
         gc.collect()
         torch.accelerator.empty_cache()
 
+    def mark_weights_modified(self) -> None:
+        """Weights may be rewritten from now on: their backups are stale."""
+        # A copy: a tensor freed by garbage collection during the loop
+        # removes its entry.
+        for data in list(self.pointer_to_data.values()):
+            if data.tag == "weights":
+                data.backup_in_sync = False
+
     def _put_to_sleep(self, ptr: int, data: AllocationData, offload: bool) -> None:
         if offload:
             if data.cpu_backup_tensor is None:
                 data.cpu_backup_tensor = self._create_cpu_backup(data.handle[1])
-            cpu_ptr = data.cpu_backup_tensor.data_ptr()
-            libcudart.cudaMemcpy(cpu_ptr, ptr, data.handle[1])
+                data.backup_in_sync = False
+            if not (
+                self.reuse_weights_backup
+                and data.tag == "weights"
+                and data.backup_in_sync
+            ):
+                cpu_ptr = data.cpu_backup_tensor.data_ptr()
+                libcudart.cudaMemcpy(cpu_ptr, ptr, data.handle[1])
+                data.backup_in_sync = True
         elif data.cpu_backup_tensor is not None:
             self._release_cpu_backup(data.cpu_backup_tensor)
             data.cpu_backup_tensor = None
+            data.backup_in_sync = False
         try:
             self._unmap_and_release(data.handle)
         finally:
@@ -385,6 +404,7 @@ class CuMemAllocator:
                 if data.cpu_backup_tensor is not None:
                     cpu_ptr = data.cpu_backup_tensor.data_ptr()
                     libcudart.cudaMemcpy(ptr, cpu_ptr, handle[1])
+                    data.backup_in_sync = True
                 elif current_platform.is_rocm():
                     # amdgpu <6.14 may return stale VRAM (#44972); drop with its support
                     libcudart.cudaMemset(ptr, 0, handle[1])

@@ -1204,6 +1204,10 @@ class WorkerProc:
             if isinstance(method, str):
                 func = getattr(self.worker, method)
             elif isinstance(method, bytes):
+                # An arbitrary callable may write the model's weights.
+                from vllm.device_allocator import mark_weights_modified
+
+                mark_weights_modified()
                 func = partial(cloudpickle.loads(method), self.worker)
 
             watchdog = get_watch_dog()

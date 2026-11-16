@@ -3,6 +3,7 @@
 """A GPU worker class."""
 
 import copy
+import functools
 import gc
 import os
 import time
@@ -27,7 +28,7 @@ from vllm.config import (
 )
 from vllm.config.compilation import CompilationMode
 from vllm.config.profiler import validate_profile_prefix
-from vllm.device_allocator import get_mem_allocator_instance
+from vllm.device_allocator import get_mem_allocator_instance, mark_weights_modified
 from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
@@ -225,6 +226,35 @@ class AsyncIntermediateTensors(IntermediateTensors):
 _MAX_SPLIT_SIZE_MB = 21
 
 
+def _rewrites_weights(method):
+    """Mark the sleep allocator's weights backups stale before `method` runs
+    (a method that fails half way has still written)."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        mark_weights_modified()
+        return method(self, *args, **kwargs)
+
+    wrapper._rewrites_weights = True
+    return wrapper
+
+
+def _may_reuse_weights_backup(vllm_config: VllmConfig) -> bool:
+    """Whether nothing rewrites weights outside the hooked Worker methods.
+
+    LoRA and expert rebalancing write them while serving, a worker extension
+    adds methods that can, and fault-tolerance commands reach the worker
+    directly; a sleep must keep copying weights for those engines.
+    """
+    parallel_config = vllm_config.parallel_config
+    return (
+        vllm_config.lora_config is None
+        and not parallel_config.enable_eplb
+        and not parallel_config.worker_extension_cls
+        and not parallel_config.enable_fault_tolerance
+    )
+
+
 class Worker(WorkerBase):
     def __init__(
         self,
@@ -397,6 +427,7 @@ class Worker(WorkerBase):
     def checkpoint_prepare(self) -> None:
         checkpoint_prepare_distributed_state()
 
+    @_rewrites_weights
     def checkpoint_restore(self) -> None:
         checkpoint_restore_distributed_state()
 
@@ -413,6 +444,7 @@ class Worker(WorkerBase):
         digests = compute_tensor_digests(self.model_runner.get_model())
         return {prefix + name: digest for name, digest in digests.items()}
 
+    @_rewrites_weights
     def reset_weights(self) -> None:
         zero_weights(self.model_runner.get_model())
 
@@ -619,6 +651,7 @@ class Worker(WorkerBase):
 
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
+    @_rewrites_weights
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         with (
             self._maybe_get_memory_pool_context(tag="weights"),
@@ -645,6 +678,19 @@ class Worker(WorkerBase):
 
             self._pp_transport = create_pp_transport(self.vllm_config, persistent)
 
+        model_config = self.vllm_config.model_config
+        if (
+            envs.VLLM_SLEEP_REUSE_WEIGHTS_BACKUP
+            and current_platform.is_cuda_alike()
+            and model_config.enable_cumem_allocator
+            and model_config.sleep_mode_backend == "cumem"
+        ):
+            # Only now is the singleton allocator touched. A subclass may add
+            # writers that are not hooked.
+            get_mem_allocator_instance().reuse_weights_backup = (
+                type(self) is Worker and _may_reuse_weights_backup(self.vllm_config)
+            )
+
         if has_ec_transfer():
             get_ec_transfer().start_worker_services()
 
@@ -660,6 +706,11 @@ class Worker(WorkerBase):
         # for profiling and compilation so Dynamo's global-state guards remain
         # valid when requests arrive.
         set_torch_threads_for_runtime()
+
+    @_rewrites_weights
+    def apply_model(self, fn):
+        # Runs arbitrary code on the model (collective_rpc), possibly writing it.
+        return super().apply_model(fn)
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         """Apply config overrides to the worker, its model runner and the
@@ -678,6 +729,7 @@ class Worker(WorkerBase):
             setattr(self.model_runner, config_name, new_config)
             setattr(self, config_name, new_config)
 
+    @_rewrites_weights
     def reload_weights(
         self,
         weights_iterator: Iterable[tuple[str, torch.Tensor]] | None = None,
@@ -1635,9 +1687,11 @@ class Worker(WorkerBase):
             num_active_loras=0,
         )
 
+    @_rewrites_weights
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)
 
+    @_rewrites_weights
     def remove_lora(self, lora_id: int) -> bool:
         return self.model_runner.remove_lora(lora_id)
 
@@ -1706,6 +1760,7 @@ class Worker(WorkerBase):
     def has_incomplete_weight_update(self) -> bool:
         return bool(self._incomplete_weight_updates)
 
+    @_rewrites_weights
     def start_weight_update(self) -> None:
         """Start a new weight update session.
 
@@ -1716,6 +1771,7 @@ class Worker(WorkerBase):
         with set_current_vllm_config(self.vllm_config):
             self._start_weight_update()
 
+    @_rewrites_weights
     def start_draft_weight_update(self) -> None:
         """Like start_weight_update, but retargets the engine at the speculative
         draft model for this session.
@@ -1779,6 +1835,7 @@ class Worker(WorkerBase):
         self._weight_update_active = True
         self._weight_update_is_draft = is_draft
 
+    @_rewrites_weights
     def update_weights(self, update_info: dict | list[dict]) -> None:
         """Receive one weight update chunk from the trainer.
 
@@ -1825,6 +1882,7 @@ class Worker(WorkerBase):
         ):
             restore_quantized_lm_heads(draft_model, refresh=refresh)
 
+    @_rewrites_weights
     def finish_weight_update(self) -> None:
         """Finish the current weight update session."""
         self._check_weight_transfer_engine()
@@ -1883,6 +1941,7 @@ class Worker(WorkerBase):
             if CuMemAllocator.instance is not None:
                 CuMemAllocator.instance.release_pools()
 
+    @_rewrites_weights
     def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)
 
